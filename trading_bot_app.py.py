@@ -9,8 +9,8 @@ import logging
 
 
 # Configure API keys and exchange
-api_key = '6fgT4NZPtvT7ByjuqZar6vC3TpQn8RYSOtWDkKyOq17EXRfmJVZecKpWKsvpibCN'
-api_secret = 'm2JLZEzndijOABGxYO0zKwjcnjIqqM0Ns2H3TVxwB29Lk2AifAlVuevBkRcqhc1f'
+api_key = 'Your API KEy'
+api_secret = 'Your Api Secrete KEy'
 exchange = ccxt.binance({
     'apiKey': api_key,
     'secret': api_secret,
