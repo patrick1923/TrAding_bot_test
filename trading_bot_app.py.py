@@ -6,11 +6,12 @@ import json
 import websocket
 from datetime import datetime, timedelta
 import logging
+import datetime
 
 
 # Configure API keys and exchange
-api_key = 'Your API KEy'
-api_secret = 'Your Api Secrete KEy'
+api_key = 'your api'
+api_secret = 'your api'
 exchange = ccxt.binance({
     'apiKey': api_key,
     'secret': api_secret,
@@ -18,10 +19,28 @@ exchange = ccxt.binance({
 })
 
 # Bot parameters
-stop_loss_percentage = 0.2  # 2% stop loss
-timeframe_higher = '4h'  # Changed to 4-hour timeframe
+stop_loss_percentage = 20.0  # 80% stop loss
+timeframe_higher = '1d'  # Changed to 1day timeframe
 timeframe_lower = '1m'    # Changed to 1-minute timeframe
 min_volume = 500_000_000  # Minimum 24-hour volume in USDT
+
+# Initialize a DataFrame to log trades
+trade_log = pd.DataFrame(columns=[
+                         'timestamp', 'symbol', 'entry_price', 'exit_price', 'position_size', 'outcome', 'action'])
+
+
+def log_trade(timestamp, symbol, entry_price, exit_price, position_size, outcome, action):
+    global trade_log
+    trade_log = trade_log.append({
+        'timestamp': timestamp,
+        'symbol': symbol,
+        'entry_price': entry_price,
+        'exit_price': exit_price,
+        'position_size': position_size,
+        'outcome': outcome,
+        'action': action  # 'placed' or 'closed'
+    }, ignore_index=True)
+
 
 # Configure logging
 logging.basicConfig(filename='trading_bot.log', level=logging.INFO,
@@ -34,11 +53,11 @@ market_data = {}
 
 def get_top_pairs(limit=45):
     # Define a list of known meme coin symbols
-    meme_coins = ['DOGE', 'SHIB', 'PEPE', 'KNC'
-                  'ADA', 'SAFE',  'SUI']  # Add more as needed
+    meme_coins = ['DOGE', 'ADA', 'PEPE', 'ETH'
+                  'SUI']  # Add more as needed
 
     # Define a list of known oracle coin symbols
-    oracle_coins = ['BAND', 'BEL', 'AAVE', 'API3']  # Add more as needed
+    oracle_coins = ['BTC', 'BNB', 'SOL']  # Add more as needed
 
     markets = exchange.fetch_markets()
     # Filter for USDT pairs and check if they are meme or oracle coins
@@ -107,12 +126,13 @@ def identify_key_levels(df):
 def find_entry(df_lower, bias, pdh, pdl):
     for i in range(1, len(df_lower)):
         if bias == "bullish":
-            if df_lower['low'].iloc[i] < pdl:
+            # Look for breakouts or retests near PDL
+            if df_lower['low'].iloc[i] < pdl and df_lower['close'].iloc[i] > pdl:
                 return df_lower['close'].iloc[i]  # Return only the entry price
         elif bias == "bearish":
-            if df_lower['high'].iloc[i] > pdh:
-                return df_lower['close'].iloc[i]
-                # Return only the entry price
+            # Look for breakdowns or retests near PDH
+            if df_lower['high'].iloc[i] > pdh and df_lower['close'].iloc[i] < pdh:
+                return df_lower['close'].iloc[i]  # Return only the entry price
     return None  # Return None if no entry price is found
 
 # Fetch minimum order size for the symbol
@@ -148,6 +168,9 @@ def place_order(symbol, side, price, quantity, stop_loss_price=None):
         current_order = order
         logging.info(f"Order placed: {order}")
         print(f"Order successfully placed: {order}")
+        # Assuming the order is successfully placed
+        entry_price = price  # This would be the price at which the order was placed
+        current_time = datetime.utcnow()
 
         # Place stop-loss limit order if a stop_loss_price is provided
         if stop_loss_price is not None:
@@ -162,6 +185,42 @@ def place_order(symbol, side, price, quantity, stop_loss_price=None):
     except Exception as e:
         logging.error(f"Error placing order for {symbol}: {e}")
         print(f"Error placing order for {symbol}: {e}")
+        log_trade(current_time, symbol, entry_price,
+                  None, quantity, None, 'placed')
+
+# Function to manually close a position
+
+
+def manual_close_position(symbol, exit_price):
+    global active_orders
+    if symbol in active_orders:
+        order_info = active_orders[symbol]
+        entry_price = order_info['entry_price']
+        position_size = order_info['position_size']
+
+        # Determine if the trade was successful
+        if exit_price > entry_price:  # For a buy position
+            outcome = 'profit'
+        elif exit_price < entry_price:  # For a sell position
+            outcome = 'loss'
+        else:
+            outcome = 'break-even'
+
+        # Log the closure of the trade
+        log_trade(datetime.utcnow(), symbol, entry_price,
+                  exit_price, position_size, outcome, 'closed')
+
+        # Remove the order from active orders
+        del active_orders[symbol]
+        print(f"Position for {symbol} manually closed. Outcome: {outcome}")
+
+# Function to automatically close a position
+
+
+def auto_close_position(symbol, exit_price):
+    # Similar logic to manual_close_position
+    manual_close_position(symbol, exit_price)
+
 # Fetch current wallet balance
 
 
@@ -257,23 +316,32 @@ pd.set_option('display.max_columns', None)  # Show all columns
 pd.set_option('display.float_format', '{:.2f}'.format)
 
 
-# Main bot logic
+# Initialize counters
+skipped_pairs = 0
+no_valid_entry_pairs = 0
+
+# Initialize summary variables
+total_pairs_analyzed = 0
+total_skipped_pairs = 0
+total_no_valid_entries = 0
+total_valid_entries = 0
+total_trades_executed = 0  # Track the number of trades executed
+total_profit = 0.0  # Track total profit made
 
 
 def trading_bot():
-    print("Bot is running. Starting analysis every minute...\n")
+    global total_pairs_analyzed, total_skipped_pairs, total_no_valid_entries, total_valid_entries, total_trades_executed, total_profit
 
-    active_orders = {}  # Format: {symbol: {'timestamp': <time>, 'bias': <bias>}}
-    ORDER_COOLDOWN = 300  # Cooldown period in seconds (5 minutes)
-    MAX_NOTIONAL_VALUE = 1000
-    MIN_NOTIONAL_VALUE = 1
+    print("Bot is running. Starting analysis every minute...\n")
 
     while True:
         try:
-            current_time = datetime.utcnow() + timedelta(hours=3)
+            current_time = datetime.datetime.utcnow() + timedelta(hours=3)
             print(f"Current UTC+3 Time: {current_time}")
 
             top_pairs = get_top_pairs(limit=45)
+            # Increment total pairs analyzed
+            total_pairs_analyzed += len(top_pairs)
             print(f"Analyzing top futures pairs: {top_pairs}")
 
             wallet_balance = get_wallet_balance()
@@ -282,126 +350,106 @@ def trading_bot():
             for symbol in top_pairs:
                 print(f"\nAnalyzing {symbol}...")
 
+                # Fetch data for the 1-day timeframe
                 df_higher = fetch_data(symbol, timeframe_higher, limit=2)
                 if df_higher is None:
                     print(f"Skipping {symbol} due to data fetch error.")
+                    total_skipped_pairs += 1  # Increment skipped pairs counter
                     continue
 
+                # Fetch data for the 1-minute timeframe
                 df_lower = fetch_data(symbol, timeframe_lower)
                 if df_lower is None:
                     print(f"Skipping {symbol} due to data fetch error.")
+                    total_skipped_pairs += 1  # Increment skipped pairs counter
                     continue
 
-                # Analyze the current bias
+                # Analyze the current bias using the 1-day data
                 current_bias = analyze_price_movement(df_higher)
                 pdh, pdl = identify_key_levels(df_higher)
                 print(
-                    f"4-Hour Bias: {current_bias}, Previous Day High: {pdh}, Previous Day Low: {pdl}")
+                    f"1-Day Bias: {current_bias}, Previous Day High: {pdh}, Previous Day Low: {pdl}")
 
-                # Check if there is an active order for this symbol
-                if symbol in active_orders:
-                    order_info = active_orders[symbol]
-                    time_since_last_order = (
-                        current_time - order_info['timestamp']).total_seconds()
-
-                    # Check if the order cooldown period has passed
-                    if time_since_last_order < ORDER_COOLDOWN:
+                # Check for valid entry setup
+                entry_price = None  # Initialize entry_price
+                if current_bias in ["strong_bullish", "bullish"]:
+                    entry_price = find_entry(df_lower, current_bias, pdh, pdl)
+                    if entry_price:
                         print(
-                            f"Skipping {symbol} due to active order. Cooldown period not yet passed.")
-                        continue  # Skip to the next pair
+                            f"Valid entry setup for {symbol} (Bullish) at price: {entry_price}")
 
-                    # Check if the bias has changed
-                    if current_bias != order_info['bias']:
+                        # Check if there is sufficient balance to place the order
+                        min_order_size = get_min_order_size(symbol)
+                        order_amount, notional_value = calculate_order_amount(
+                            wallet_balance, entry_price, min_order_size, max_notional_value)
+
+                        if order_amount <= 0 or wallet_balance < entry_price * order_amount:
+                            print(
+                                f"Insufficient balance to place order for {symbol}. Terminating the bot.")
+                            generate_final_summary()  # Generate final summary report
+                            exit()  # Exit the program
+
+                        total_valid_entries += 1  # Increment valid entries counter
+                        # Here you would execute the trade and update total_trades_executed and total_profit
+                    else:
                         print(
-                            f"Bias changed for {symbol}. Closing existing order and placing a new one.")
-                        cancel_order(symbol)  # Close the existing order
-                        # Remove the symbol from active orders after canceling
-                        del active_orders[symbol]
-                else:
-                    # If there is no active order, proceed to place a new order
-                    if current_bias in ["strong_bullish", "bullish"]:
-                        entry_price = find_entry(
-                            df_lower, current_bias, pdh, pdl)
-                        if entry_price:
-                            stop_loss_price = entry_price * \
-                                (1 - stop_loss_percentage / 100)
+                            f"No valid entry setup for {symbol} with bullish bias.")
+                        total_no_valid_entries += 1  # Increment no valid entry counter
+                elif current_bias in ["strong_bearish", "bearish"]:
+                    entry_price = find_entry(df_lower, current_bias, pdh, pdl)
+                    if entry_price:
+                        print(
+                            f"Valid entry setup for {symbol} (Bearish) at price: {entry_price}")
+
+                        # Check if there is sufficient balance to place the order
+                        min_order_size = get_min_order_size(symbol)
+                        order_amount, notional_value = calculate_order_amount(
+                            wallet_balance, entry_price, min_order_size, max_notional_value)
+
+                        if order_amount <= 0 or wallet_balance < entry_price * order_amount:
                             print(
-                                f"Placing new Buy Order at price {entry_price} with stop-loss at {stop_loss_price}")
+                                f"Insufficient balance to place order for {symbol}. Terminating the bot.")
+                            generate_final_summary()  # Generate final summary report
+                            exit()  # Exit the program
 
-                            # Fetch minimum order size for the symbol
-                            min_order_size = get_min_order_size(symbol)
+                        total_valid_entries += 1  # Increment valid entries counter
+                        # Here you would execute the trade and update total_trades_executed and total_profit
+                    else:
+                        print(
+                            f"No valid entry setup for {symbol} with bearish bias.")
+                        total_no_valid_entries += 1  # Increment no valid entry counter
 
-                            # Calculate order amount based on wallet balance, entry price, and limits
-                            order_amount, notional_value = calculate_order_amount(
-                                wallet_balance, entry_price, min_order_size, MAX_NOTIONAL_VALUE)
-
-                            # Check if the notional value is below the minimum required
-                            if notional_value < MIN_NOTIONAL_VALUE:
-                                print(
-                                    f"Cannot place order for {symbol}. Notional value {notional_value:.2f} is less than minimum required {MIN_NOTIONAL_VALUE}. Skipping to the next pair.")
-                                continue
-
-                            # Check minimum order size
-                            if order_amount < min_order_size:
-                                print(
-                                    f"Cannot place order for {symbol}. Order amount {order_amount} is less than minimum order size {min_order_size}. Skipping to the next pair.")
-                                continue
-
-                            # Place the order with the stop-loss price
-                            place_order(symbol, 'buy', entry_price,
-                                        order_amount, stop_loss_price)
-                            # Update active orders with the new bias and timestamp
-                            active_orders[symbol] = {
-                                'timestamp': current_time, 'bias': current_bias}
-                        else:
-                            print(
-                                f"No valid entry setup for {symbol} with bullish bias.")
-
-                    elif current_bias in ["strong_bearish", "bearish"]:
-                        entry_price = find_entry(
-                            df_lower, current_bias, pdh, pdl)
-                        if entry_price:
-                            stop_loss_price = entry_price * \
-                                (1 + stop_loss_percentage / 100)
-                            print(
-                                f"Placing new Sell Order at price {entry_price} with stop-loss at {stop_loss_price}")
-
-                            # Fetch minimum order size for the symbol
-                            min_order_size = get_min_order_size(symbol)
-
-                            # Calculate order amount based on wallet balance, entry price, and limits
-                            order_amount, notional_value = calculate_order_amount(
-                                wallet_balance, entry_price, min_order_size, MAX_NOTIONAL_VALUE)
-
-                            # Check if the notional value is below the minimum required
-                            if notional_value < MIN_NOTIONAL_VALUE:
-                                print(
-                                    f"Cannot place order for {symbol}. Notional value {notional_value:.2f} is less than minimum required {MIN_NOTIONAL_VALUE}. Skipping to the next pair.")
-                                continue
-
-                            # Check minimum order size
-                            if order_amount < min_order_size:
-                                print(
-                                    f"Cannot place order for {symbol}. Order amount {order_amount} is less than minimum order size {min_order_size}. Skipping to the next pair.")
-                                continue
-
-                            # Place the order with the stop-loss price
-                            place_order(symbol, 'sell', entry_price,
-                                        order_amount, stop_loss_price)
-                            # Update active orders with the new bias and timestamp
-                            active_orders[symbol] = {
-                                'timestamp': current_time, 'bias': current_bias}
-                        else:
-                            print(
-                                f"No valid entry setup for {symbol} with bearish bias.")
+            # Summary of analysis for this cycle
+            print(f"\nTotal pairs analyzed: {total_pairs_analyzed}")
+            print(f"Skipped pairs: {total_skipped_pairs}")
+            print(f"No valid entry setups: {total_no_valid_entries}")
+            print(f"Valid entry setups: {total_valid_entries}")
 
             print("\nWaiting for the next analysis...")
-            time.sleep(60)  # Sleep for 60 seconds before the next analysis
+            time.sleep(300)  # Sleep for 5 mins before the next analysis
 
         except Exception as e:
             print(f"Error: {e}")
             time.sleep(60)  # Retry after 1 minute if an error occurs
 
+# Function to generate final summary when closing the bot
+
+
+def generate_final_summary():
+    print("\n--- Final Summary Report ---")
+    print(f"Total pairs analyzed: {total_pairs_analyzed}")
+    print(f"Total skipped pairs: {total_skipped_pairs}")
+    print(f"Total no valid entry setups: {total_no_valid_entries}")
+    print(f"Total valid entry setups: {total_valid_entries}")
+    print(f"Total trades executed: {total_trades_executed}")
+    print(f"Total profit made: {total_profit:.2f} USDT")
+    # Assuming start_time is defined at the beginning
+    print(f"Uptime: {datetime.datetime.now() - start_time}")
+
 
 if __name__ == "__main__":
-    trading_bot()
+    start_time = datetime.datetime.now()  # Record the start time
+    try:
+        trading_bot()
+    except KeyboardInterrupt:
+        generate_final_summary()  # Call the summary function on exit
